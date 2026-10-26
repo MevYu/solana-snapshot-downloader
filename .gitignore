@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+*.part
+*.part.json
+*.complete.json
+snapshot-*.tar*
+incremental-snapshot-*.tar*
+.snapshot-downloader.lock
