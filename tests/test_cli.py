@@ -9,9 +9,9 @@ import sys
 import tempfile
 import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from downloader.cli import download_candidate, output_lock, parser
+from downloader.cli import Progress, download_candidate, output_lock, parser
 from downloader.discovery import DiscoveryError
 from downloader.download import DownloadError
 from downloader.models import Candidate, snapshot_from_url
@@ -26,7 +26,7 @@ DATA = {FULL: b"full test archive" * 8192, INC: b"incremental test archive" * 10
 
 
 @contextmanager
-def fixture(fail=False, rollover=False, stale=False):
+def fixture(fail=False, rollover=False, stale=False, fail_probes=False):
     state = {"gets": [], "rpc": 0, "incremental_heads": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -50,6 +50,9 @@ def fixture(fail=False, rollover=False, stale=False):
             self.serve(True)
 
         def serve(self, body):
+            if not body and fail_probes:
+                self.send_error(503)
+                return
             name = self.path.lstrip("/")
             if name == "snapshot.tar.zst":
                 target = FULL
@@ -101,12 +104,16 @@ def fixture(fail=False, rollover=False, stale=False):
 
 class CLITests(unittest.TestCase):
     def command(self, node, output, *args):
-        return subprocess.run(
+        result = subprocess.run(
             [sys.executable, str(ROOT / "snapshot_downloader.py"), "--node", node,
              "--rpc", node + "/rpc", "--output", str(output), "--attempts", "1",
              "--retries", "0", "--retry-delay", "0", "--speed-test-count", "0",
-             "--timeout", "1", *args], text=True, capture_output=True, timeout=15,
+             "--timeout", "1", *args], capture_output=True, timeout=15,
         )
+        # Decode explicitly so universal-newline conversion cannot hide stray CRs.
+        result.stdout = result.stdout.decode("utf-8")
+        result.stderr = result.stderr.decode("utf-8")
+        return result
 
     def test_download_pair_and_reuse_receipts(self):
         with tempfile.TemporaryDirectory() as temp, fixture() as (url, state):
@@ -114,9 +121,25 @@ class CLITests(unittest.TestCase):
             first = self.command(url, output)
             self.assertEqual(first.returncode, 0, first.stderr)
             self.assertIn("Done.", first.stderr)
+            phases = ("[1/3] Search", "[2/3] Speed", "[3/3] Full", "[3/3] Incremental")
+            positions = [first.stderr.index(phase) for phase in phases]
+            self.assertEqual(positions, sorted(positions))
+            self.assertIn("Waiting for RPC seed", first.stderr)
+            self.assertIn("0/1 nodes", first.stderr)
+            self.assertIn("1 usable, 0 skipped", first.stderr)
+            self.assertIn("MiB/s", first.stderr)
+            self.assertIn("ETA", first.stderr)
+            self.assertNotIn("\r", first.stderr)
+            self.assertNotIn("\x1b", first.stderr)
+            self.assertEqual(len(first.stdout.splitlines()), 2)
+            self.assertNotIn("[1/3]", first.stdout)
+            state_file = json.loads((output / ".download-state.json").read_text())
+            self.assertEqual(state_file["version"], 1)
             for filename in (FULL, INC):
                 self.assertEqual((output / filename).read_bytes(), DATA[filename])
-                self.assertTrue((output / (filename + ".complete.json")).is_file())
+                self.assertIn("complete", state_file["files"][filename])
+                self.assertFalse((output / (filename + ".complete.json")).exists())
+                self.assertFalse((output / (filename + ".part.json")).exists())
                 self.assertFalse((output / (filename + ".part")).exists())
             self.assertEqual(state["gets"], [FULL, INC])
             second = self.command(url, output)
@@ -133,12 +156,18 @@ class CLITests(unittest.TestCase):
             self.assertEqual(listing["candidates"][0]["incremental"]["base_slot"], 1000)
             self.assertFalse(output.exists())
             self.assertEqual(state["gets"], [])
+            self.assertIn("[1/3] Search", result.stderr)
+            self.assertNotIn("[2/3]", result.stderr)
+            self.assertNotIn("\r", result.stderr)
+            self.assertNotIn("\x1b", result.stderr)
 
     def test_http_failure_is_nonzero_and_never_done(self):
         with tempfile.TemporaryDirectory() as temp, fixture(fail=True) as (url, _):
             result = self.command(url, Path(temp))
             self.assertEqual(result.returncode, 1, result.stderr)
             self.assertNotIn("Done.", result.stderr)
+            self.assertIn("Full failed", result.stderr)
+            self.assertNotIn("Full ready", result.stderr)
             self.assertFalse((Path(temp) / FULL).exists())
             self.assertFalse((Path(temp) / INC).exists())
 
@@ -147,7 +176,65 @@ class CLITests(unittest.TestCase):
             result = self.command(url, Path(temp), "--speed-test-count", "1")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("Sample", result.stderr)
+            self.assertIn("Sample 1/1: " + url, result.stderr)
+            self.assertIn("[2/3] Speed", result.stderr)
+            self.assertIn("0/1 nodes", result.stderr)
+            self.assertIn("1/1 nodes", result.stderr)
+            self.assertIn("MB/s", result.stderr)
             self.assertEqual(state["gets"], [FULL, FULL, INC])
+
+    def test_search_counts_failed_probes(self):
+        with tempfile.TemporaryDirectory() as temp, fixture() as (url, _), \
+                fixture(fail_probes=True) as (bad_url, _):
+            result = self.command(url, Path(temp), "--node", bad_url, "--list")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("0/2 nodes", result.stderr)
+            self.assertIn("2/2 nodes", result.stderr)
+            self.assertIn("1 usable, 1 skipped", result.stderr)
+
+    def test_failed_speed_sample_advances_progress_and_finishes(self):
+        with tempfile.TemporaryDirectory() as temp, fixture(fail=True) as (url, _):
+            result = self.command(url, Path(temp), "--speed-test-count", "1")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("[2/3] Speed", result.stderr)
+            self.assertIn("1/1 nodes", result.stderr)
+            self.assertIn("Sample: 0 usable, 1 skipped", result.stderr)
+            self.assertNotIn("Done.", result.stderr)
+
+    def test_search_failure_finishes_with_probe_counts(self):
+        with tempfile.TemporaryDirectory() as temp, fixture(fail_probes=True) as (url, _):
+            result = self.command(url, Path(temp), "--list")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("Search failed; 0 usable, 1 skipped", result.stderr)
+            self.assertIn("1/1 nodes", result.stderr)
+            self.assertNotIn("Done.", result.stderr)
+
+    def test_byte_completion_does_not_report_success_before_finalization(self):
+        candidate = Candidate("http://node/", snapshot_from_url("http://node/" + FULL))
+        args = parser().parse_args(["--full-only"])
+        display = Mock()
+        downloader = Mock()
+
+        def failed_finalize(snapshot, output):
+            Progress(display)(snapshot, 100, 100, 50)
+            display.finish.assert_not_called()
+            raise DownloadError("Could not write receipt")
+
+        downloader.download.side_effect = failed_finalize
+        with self.assertRaises(DownloadError):
+            download_candidate(candidate, downloader, args, ["http://rpc/"], progress=display)
+        display.start.assert_called_once_with("[3/3] Full", unit="bytes", detail="Connecting")
+        display.update.assert_called_once_with(100, total=100, detail="Finalizing archive", speed=50)
+        display.finish.assert_called_once_with("Full failed")
+
+    def test_interrupted_download_finishes_active_phase(self):
+        candidate = Candidate("http://node/", snapshot_from_url("http://node/" + FULL))
+        display = Mock()
+        downloader = Mock()
+        downloader.download.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            download_candidate(candidate, downloader, parser().parse_args([]), ["http://rpc/"], progress=display)
+        display.finish.assert_called_once_with("Full interrupted")
 
     def test_rollover_does_not_mix_another_base_incremental(self):
         with tempfile.TemporaryDirectory() as temp, fixture(rollover=True) as (url, state):
@@ -168,7 +255,6 @@ class CLITests(unittest.TestCase):
                               snapshot_from_url("http://node/" + INC))
         args = parser().parse_args([])
         args.output = Path("unused")
-        from unittest.mock import Mock
         downloader = Mock()
         downloader.download.side_effect = [Path(FULL), Path(INC)]
         with patch("downloader.cli.probe_incremental", return_value=candidate.incremental), \
@@ -193,6 +279,27 @@ class CLITests(unittest.TestCase):
                 result = subprocess.run([sys.executable, str(ROOT / "snapshot_downloader.py"), *args],
                                         text=True, capture_output=True, timeout=5)
                 self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_help_is_compact_and_help_all_preserves_advanced_flags(self):
+        command = [sys.executable, str(ROOT / "snapshot_downloader.py")]
+        common = subprocess.run(command + ["--help"], text=True, capture_output=True, timeout=5)
+        complete = subprocess.run(command + ["--help-all"], text=True, capture_output=True, timeout=5)
+        self.assertEqual(common.returncode, 0, common.stderr)
+        self.assertEqual(complete.returncode, 0, complete.stderr)
+        self.assertEqual(common.stderr, "")
+        self.assertEqual(complete.stderr, "")
+        for flag in ("-o", "--output", "--network", "--rpc", "--node", "--list", "--full-only",
+                     "--min-speed", "--verbose", "--version", "--help-all"):
+            self.assertIn(flag, common.stdout)
+        for flag in ("--workers", "--timeout", "--max-slot-age", "--json", "--speed-test-count",
+                     "--speed-test-seconds", "--speed-window", "--retries", "--retry-delay", "--attempts"):
+            self.assertNotIn(flag, common.stdout)
+            self.assertIn(flag, complete.stdout)
+        defaults = parser().parse_args([])
+        self.assertEqual(defaults.output, Path("snapshots"))
+        self.assertEqual(defaults.workers, 32)
+        self.assertEqual(defaults.speed_test_count, 5)
+        self.assertEqual(parser().parse_args(["-o", "custom"]).output, Path("custom"))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- Show live search, speed-test and download progress, with byte totals, speed and ETA.
+- Keep redirected logs readable and JSON output separate from progress.
+- Simplify the default help and getting-started documentation; use `--help-all` for advanced options.
+- Store only the current full/incremental download state in one `.download-state.json`, with on-demand migration of older per-file records.
+
 ## 0.1.2
 
 Rename the Python package to `downloader`. Run from source with `python3 snapshot_downloader.py` or `python3 -m downloader`.

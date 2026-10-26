@@ -27,6 +27,7 @@ jobs:
       - name: Check source entry points
         run: |
           python3 snapshot_downloader.py --help
+          python3 snapshot_downloader.py --help-all
           python3 -m downloader --version
       - name: Build and check archives
         run: |

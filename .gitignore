@@ -8,3 +8,4 @@ dist/
 snapshot-*.tar*
 incremental-snapshot-*.tar*
 .snapshot-downloader.lock
+.download-state.json

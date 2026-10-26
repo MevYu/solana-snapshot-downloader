@@ -12,12 +12,14 @@ import time
 import unittest
 from unittest.mock import patch
 
+import downloader.download as download_module
 from downloader.download import DownloadError, DownloadOptions, Downloader
 from downloader.models import snapshot_from_url
 
 
 NAME = "snapshot-123-" + "A" * 32 + ".tar.zst"
 OTHER_NAME = "snapshot-124-" + "B" * 32 + ".tar.zst"
+INCREMENTAL = "incremental-snapshot-123-125-" + "C" * 32 + ".tar.zst"
 DATA = bytes(range(256)) * 64
 
 
@@ -89,7 +91,15 @@ class DownloadTests(unittest.TestCase):
 
     @property
     def metadata(self):
+        """The old sidecar path, used only by migration tests."""
         return self.output / (NAME + ".part.json")
+
+    @property
+    def state(self):
+        return self.output / ".download-state.json"
+
+    def records(self):
+        return json.loads(self.state.read_text())["files"] if self.state.exists() else {}
 
     @property
     def final(self):
@@ -100,13 +110,28 @@ class DownloadTests(unittest.TestCase):
         return Downloader(options, **kwargs).download(snapshot_from_url(url), self.output)
 
     def interrupt(self, url, count=4096):
+        filename = snapshot_from_url(url).filename
         def progress(snapshot, done, total, speed):
             if done >= count:
                 raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
             self.download(url, progress=progress)
-        self.assertEqual(self.partial.stat().st_size, count)
-        self.assertFalse(self.final.exists())
+        self.assertEqual((self.output / (filename + ".part")).stat().st_size, count)
+        self.assertFalse((self.output / filename).exists())
+
+    def legacyize(self, kind, filename=NAME):
+        state = json.loads(self.state.read_text())
+        record = state["files"][filename].pop(kind)
+        if not state["files"][filename]:
+            del state["files"][filename]
+        if state["files"]:
+            self.state.write_text(json.dumps(state))
+        else:
+            self.state.unlink()
+        suffix = ".part.json" if kind == "partial" else ".complete.json"
+        path = self.output / (filename + suffix)
+        path.write_text(json.dumps(record))
+        return path
 
     def test_complete_download_progress_and_receipt_reuse(self):
         requests = []
@@ -122,7 +147,8 @@ class DownloadTests(unittest.TestCase):
             self.assertEqual(path.read_bytes(), DATA)
             self.assertFalse(self.partial.exists())
             self.assertFalse(self.metadata.exists())
-            self.assertTrue((self.output / (NAME + ".complete.json")).is_file())
+            self.assertFalse((self.output / (NAME + ".complete.json")).exists())
+            self.assertEqual(set(self.records()[NAME]), {"complete"})
             self.assertEqual(self.download(url), path)
             self.assertEqual(len(requests), 1)
             self.assertEqual(requests[0]["Accept-Encoding"], "identity")
@@ -307,7 +333,7 @@ class DownloadTests(unittest.TestCase):
                     self.assertEqual(self.download(url).read_bytes(), DATA)
                 self.assertEqual(seen, [None, None])
                 self.final.unlink()
-                (self.output / (NAME + ".complete.json")).unlink()
+                self.state.unlink()
 
     def test_last_modified_and_size_allow_resume(self):
         modified = "Wed, 21 Oct 2015 07:28:00 GMT"
@@ -324,7 +350,7 @@ class DownloadTests(unittest.TestCase):
         with server(handler) as base:
             url = base + NAME
             self.interrupt(url)
-            self.assertEqual(json.loads(self.metadata.read_text())["validator_date"], dated)
+            self.assertEqual(self.records()[NAME]["partial"]["validator_date"], dated)
             self.assertEqual(self.download(url).read_bytes(), DATA)
         self.assertEqual(seen, [None, modified])
 
@@ -345,7 +371,7 @@ class DownloadTests(unittest.TestCase):
                     self.assertEqual(self.download(url).read_bytes(), DATA)
                 self.assertEqual(seen, [None, None])
                 self.final.unlink()
-                (self.output / (NAME + ".complete.json")).unlink()
+                self.state.unlink()
 
     def test_last_modified_metadata_without_original_date_restarts(self):
         seen = []
@@ -359,9 +385,9 @@ class DownloadTests(unittest.TestCase):
         with server(handler) as base:
             url = base + NAME
             self.interrupt(url)
-            metadata = json.loads(self.metadata.read_text())
-            metadata.pop("validator_date")
-            self.metadata.write_text(json.dumps(metadata))
+            state = json.loads(self.state.read_text())
+            state["files"][NAME]["partial"].pop("validator_date")
+            self.state.write_text(json.dumps(state))
             self.assertEqual(self.download(url).read_bytes(), DATA)
         self.assertEqual(seen, [None, None])
 
@@ -411,7 +437,7 @@ class DownloadTests(unittest.TestCase):
                     with self.assertRaises(DownloadError):
                         self.download(base + NAME)
                 self.assertFalse(self.final.exists())
-                self.assertFalse((self.output / (NAME + ".complete.json")).exists())
+                self.assertNotIn("complete", self.records().get(NAME, {}))
 
     def test_html_and_json_error_responses_never_publish(self):
         cases = [
@@ -499,9 +525,10 @@ class DownloadTests(unittest.TestCase):
     def test_symlinks_are_rejected_for_all_managed_paths(self):
         target = self.output / "target"
         target.write_bytes(b"keep")
-        for suffix in ("", ".part", ".part.json", ".complete.json"):
-            with self.subTest(suffix=suffix):
-                path = self.output / (NAME + suffix)
+        paths = [self.output / (NAME + suffix) for suffix in ("", ".part", ".part.json", ".complete.json")]
+        paths.append(self.state)
+        for path in paths:
+            with self.subTest(path=path.name):
                 path.symlink_to(target)
                 with server(lambda request: self.fail("Must not make a request")) as base:
                     with self.assertRaisesRegex(DownloadError, "symlink"):
@@ -524,7 +551,294 @@ class DownloadTests(unittest.TestCase):
                     self.assertEqual(self.download(base + NAME).read_bytes(), DATA)
                 self.assertEqual(seen, [None])
                 self.final.unlink()
-                (self.output / (NAME + ".complete.json")).unlink()
+                self.state.unlink()
+
+    def test_full_and_incremental_share_one_state_file(self):
+        with server(lambda request: reply(request)) as base:
+            self.download(base + NAME)
+            self.download(base + INCREMENTAL)
+        self.assertEqual(set(self.records()), {NAME, INCREMENTAL})
+        self.assertTrue(all(set(entry) == {"complete"} for entry in self.records().values()))
+        self.assertEqual({path.name for path in self.output.iterdir()}, {NAME, INCREMENTAL, self.state.name})
+
+    def test_incremental_reset_preserves_completed_full_record(self):
+        fail_range = [False]
+
+        def handler(request):
+            if request.headers.get("Range"):
+                if fail_range[0]:
+                    range_reply(request, headers={"Content-Range": "bytes 0-12287/16384"})
+                else:
+                    range_reply(request)
+            else:
+                reply(request)
+
+        with server(handler) as base:
+            self.download(base + NAME)
+            full_record = self.records()[NAME]
+            self.interrupt(base + INCREMENTAL)
+            self.assertEqual(self.records()[NAME], full_record)
+            fail_range[0] = True
+            with self.assertRaises(DownloadError):
+                self.download(base + INCREMENTAL)
+            self.assertEqual(self.records(), {NAME: full_record})
+            fail_range[0] = False
+            self.download(base + INCREMENTAL)
+        self.assertEqual(self.records()[NAME], full_record)
+        self.assertEqual(set(self.records()[INCREMENTAL]), {"complete"})
+
+    def test_repeated_full_attempt_preserves_current_incremental(self):
+        def handler(request):
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            self.download(base + NAME)
+            self.download(base + INCREMENTAL)
+            incremental_record = self.records()[INCREMENTAL]
+            self.final.unlink()
+            self.interrupt(base + NAME)
+            self.assertEqual(self.records()[INCREMENTAL], incremental_record)
+            self.download(base + NAME)
+        self.assertEqual(self.records()[INCREMENTAL], incremental_record)
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
+
+    def test_successive_pairs_keep_only_current_full_and_incremental_state(self):
+        archives = []
+        with server(lambda request: reply(request)) as base:
+            for slot in (200, 300, 400):
+                full = "snapshot-{}-{}.tar.zst".format(slot, "A" * 32)
+                incremental = "incremental-snapshot-{}-{}-{}.tar.zst".format(slot, slot + 1, "B" * 32)
+                self.download(base + full)
+                archives.append(full)
+                self.assertEqual(set(self.records()), {full})
+                self.download(base + incremental)
+                archives.append(incremental)
+                self.assertEqual(set(self.records()), {full, incremental})
+                self.assertLessEqual(len(self.records()), 2)
+            replacement = "incremental-snapshot-400-402-{}.tar.zst".format("C" * 32)
+            self.download(base + replacement)
+            archives.append(replacement)
+            self.assertEqual(set(self.records()), {full, replacement})
+        self.assertTrue(all((self.output / filename).is_file() for filename in archives))
+        self.assertEqual(len(list(self.output.iterdir())), len(archives) + 1)
+
+    def test_legacy_partial_migrates_and_resumes(self):
+        ranges = []
+
+        def handler(request):
+            ranges.append(request.headers.get("Range"))
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            self.interrupt(url)
+            legacy = self.legacyize("partial")
+            self.assertEqual(self.download(url).read_bytes(), DATA)
+        self.assertEqual(ranges, [None, "bytes=4096-"])
+        self.assertFalse(legacy.exists())
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
+
+    def test_legacy_complete_receipt_migrates_without_network(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request.path)
+            reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            self.download(url)
+            legacy = self.legacyize("complete")
+            self.assertEqual(self.download(url).read_bytes(), DATA)
+        self.assertEqual(requests, ["/" + NAME])
+        self.assertFalse(legacy.exists())
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
+
+    def test_legacy_complete_migration_preserves_original_source_after_other_source_rejected(self):
+        requests = []
+
+        def handler(request):
+            requests.append(request.path)
+            reply(request)
+
+        with server(handler) as base:
+            source_a = base + "node-a/" + NAME
+            source_b = base + "node-b/" + NAME
+            self.download(source_a)
+            legacy = self.legacyize("complete")
+            with self.assertRaisesRegex(DownloadError, "receipt"):
+                self.download(source_b)
+            self.assertFalse(legacy.exists())
+            self.assertEqual(self.records()[NAME]["complete"]["source"], source_a)
+            self.assertEqual(self.download(source_a).read_bytes(), DATA)
+        self.assertEqual(requests, ["/node-a/" + NAME])
+
+    def test_incremental_legacy_migration_preserves_current_full(self):
+        def handler(request):
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            self.download(base + NAME)
+            full_record = self.records()[NAME]
+            self.interrupt(base + INCREMENTAL)
+            legacy = self.legacyize("partial", INCREMENTAL)
+            self.download(base + INCREMENTAL)
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.records()[NAME], full_record)
+        self.assertEqual(set(self.records()), {NAME, INCREMENTAL})
+
+    def test_central_record_is_authoritative_over_stale_legacy_metadata(self):
+        ranges = []
+
+        def handler(request):
+            ranges.append(request.headers.get("Range"))
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            self.interrupt(url)
+            stale = dict(self.records()[NAME]["partial"])
+            stale["source"] = base + "stale/" + NAME
+            self.metadata.write_text(json.dumps(stale))
+            self.download(url)
+        self.assertEqual(ranges, [None, "bytes=4096-"])
+        self.assertFalse(self.metadata.exists())
+
+    def test_malformed_or_oversized_central_state_fails_without_replacement(self):
+        cases = [b"{", b"[]", b'{"version":2,"files":{}}',
+                 b'{"version":1,"files":[]}',
+                 b'{"version":1,"files":{"invalid":{}}}',
+                 b'{"version":1,"version":1,"files":{}}', b" " * (1024 * 1024 + 1)]
+        for raw in cases:
+            with self.subTest(length=len(raw)):
+                self.state.write_bytes(raw)
+                with server(lambda request: self.fail("Must not request with corrupt state")) as base:
+                    with self.assertRaisesRegex(DownloadError, "state"):
+                        self.download(base + NAME)
+                self.assertEqual(self.state.read_bytes(), raw)
+                self.assertFalse(self.partial.exists())
+                self.assertFalse(self.final.exists())
+
+    def test_migration_write_failure_preserves_legacy_files_and_download(self):
+        for kind in ("partial", "complete"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                original_output = self.output
+                self.output = Path(directory)
+                try:
+                    with server(lambda request: reply(request)) as base:
+                        url = base + NAME
+                        self.interrupt(url) if kind == "partial" else self.download(url)
+                        legacy = self.legacyize(kind)
+                        legacy_bytes = legacy.read_bytes()
+                        archive = self.partial if kind == "partial" else self.final
+                        archive_bytes = archive.read_bytes()
+                        with patch("downloader.download._write_json", side_effect=OSError("simulated disk failure")):
+                            with self.assertRaisesRegex(DownloadError, "migrate"):
+                                self.download(url)
+                        self.assertEqual(legacy.read_bytes(), legacy_bytes)
+                        self.assertEqual(archive.read_bytes(), archive_bytes)
+                        self.assertFalse(self.state.exists())
+                        self.assertEqual(len(list(self.output.iterdir())), 2)
+                finally:
+                    self.output = original_output
+
+    def test_migration_directory_sync_failure_keeps_legacy_until_retry_commits(self):
+        def handler(request):
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            self.interrupt(url)
+            legacy = self.legacyize("partial")
+            original_bytes = self.partial.read_bytes()
+            for attempt in range(2):
+                with self.subTest(attempt=attempt):
+                    with patch("downloader.download._sync_directory", side_effect=OSError("simulated fsync failure")):
+                        with self.assertRaisesRegex(DownloadError, "migrate"):
+                            self.download(url)
+                    self.assertTrue(legacy.is_file())
+                    self.assertEqual(self.partial.read_bytes(), original_bytes)
+                    self.assertEqual(set(self.records()[NAME]), {"partial"})
+            self.download(url)
+        self.assertFalse(legacy.exists())
+        self.assertEqual(self.final.read_bytes(), DATA)
+
+    def test_invalid_legacy_complete_receipt_does_not_trust_existing_archive(self):
+        self.final.write_bytes(b"existing data")
+        legacy = self.output / (NAME + ".complete.json")
+        legacy.write_bytes(b"{" * 20000)
+        with server(lambda request: self.fail("Must not overwrite an existing archive")) as base:
+            with self.assertRaisesRegex(DownloadError, "receipt"):
+                self.download(base + NAME)
+        self.assertEqual(self.final.read_bytes(), b"existing data")
+        self.assertEqual(self.records(), {})
+
+    def test_failed_rename_keeps_partial_and_complete_state_for_retry(self):
+        real_replace = download_module.os.replace
+
+        def replace(source, destination):
+            if Path(destination) == self.final:
+                raise OSError("simulated rename failure")
+            return real_replace(source, destination)
+
+        def handler(request):
+            range_reply(request) if request.headers.get("Range") else reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            with patch("downloader.download.os.replace", side_effect=replace):
+                with self.assertRaisesRegex(DownloadError, "rename failure"):
+                    self.download(url)
+            self.assertFalse(self.final.exists())
+            self.assertEqual(self.partial.read_bytes(), DATA)
+            self.assertEqual(set(self.records()[NAME]), {"partial", "complete"})
+            self.assertEqual(self.download(url).read_bytes(), DATA)
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
+
+    def test_post_rename_cleanup_failure_recovers_without_network(self):
+        real_update = download_module._update_record
+        requests = []
+
+        def update(paths, kind, value):
+            if kind == "partial" and value is None and self.final.exists():
+                raise OSError("simulated state cleanup failure")
+            return real_update(paths, kind, value)
+
+        def handler(request):
+            requests.append(request.path)
+            reply(request)
+
+        with server(handler) as base:
+            url = base + NAME
+            with patch("downloader.download._update_record", side_effect=update):
+                self.assertEqual(self.download(url).read_bytes(), DATA)
+            self.assertEqual(set(self.records()[NAME]), {"partial", "complete"})
+            self.download(url)
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
+        self.assertEqual(len(requests), 1)
+
+    def test_post_rename_directory_sync_failure_retries_without_redownload(self):
+        real_sync = download_module._sync_directory
+        fail_once = [True]
+        requests = []
+
+        def sync(directory):
+            if self.final.exists() and fail_once[0]:
+                fail_once[0] = False
+                raise OSError("simulated archive directory fsync failure")
+            return real_sync(directory)
+
+        def handler(request):
+            requests.append(request.path)
+            reply(request)
+
+        options = DownloadOptions(retries=1, retry_delay=0, timeout=1, chunk_size=1024)
+        with server(handler) as base:
+            with patch("downloader.download._sync_directory", side_effect=sync):
+                self.assertEqual(self.download(base + NAME, options=options).read_bytes(), DATA)
+        self.assertEqual(len(requests), 1)
+        self.assertFalse(fail_once[0])
+        self.assertEqual(set(self.records()[NAME]), {"complete"})
 
     def test_disk_preflight_does_not_create_partial(self):
         with server(lambda request: reply(request)) as base:

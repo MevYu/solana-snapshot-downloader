@@ -26,10 +26,10 @@ def source_files():
     files = [ROOT / name for name in (
         "snapshot_downloader.py", "README.md", "README.en.md", "LICENSE", ".gitignore", "CHANGELOG.md",
     )]
-    for folder in ("downloader", "tests", "tools", ".github"):
+    for folder in ("downloader", "tests", "tools", ".github", "docs"):
         files.extend(path for path in (ROOT / folder).rglob("*")
                      if path.is_file() and "__pycache__" not in path.parts
-                     and path.suffix in (".py", ".yml", ".yaml"))
+                     and path.suffix in (".py", ".yml", ".yaml", ".md"))
     return sorted(files, key=lambda path: path.relative_to(ROOT).as_posix())
 
 

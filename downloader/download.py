@@ -32,6 +32,10 @@ class _Restart(DownloadError):
     """The next request must start with an empty partial archive."""
 
 
+class _StateError(DownloadError):
+    pass
+
+
 @dataclass(frozen=True)
 class DownloadOptions:
     timeout: float = 15.0
@@ -60,11 +64,13 @@ class DownloadOptions:
 class _Paths:
     final: Path
     part: Path
-    metadata: Path
-    receipt: Path
+    state: Path
+    legacy_metadata: Path
+    legacy_receipt: Path
 
 
 _METADATA_LIMIT = 16384
+_STATE_LIMIT = 1024 * 1024
 _RANGE = re.compile(r"bytes ([0-9]{1,20})-([0-9]{1,20})/([0-9]{1,20})\Z")
 _UNSATISFIED_RANGE = re.compile(r"bytes \*/([0-9]{1,20})\Z")
 _STRONG_ETAG = re.compile(r'"[\x21\x23-\x7e\x80-\xff]*"\Z')
@@ -90,27 +96,44 @@ def _open_regular(path, flags, mode=0o600):
     return fd
 
 
-def _load_json(path):
+def _unique_object(pairs):
+    result = {}
+    for name, value in pairs:
+        if name in result:
+            raise ValueError("Duplicate JSON key")
+        result[name] = value
+    return result
+
+
+def _load_json(path, limit=_METADATA_LIMIT, strict=False):
     if _regular_stat(path) is None:
         return None
     fd = _open_regular(path, os.O_RDONLY)
     with os.fdopen(fd, "rb") as stream:
-        if os.fstat(stream.fileno()).st_size > _METADATA_LIMIT:
+        if os.fstat(stream.fileno()).st_size > limit:
+            if strict:
+                raise _StateError("Download state exceeds its size limit: " + str(path))
             return None
-        raw = stream.read(_METADATA_LIMIT + 1)
-    if len(raw) > _METADATA_LIMIT:
+        raw = stream.read(limit + 1)
+    if len(raw) > limit:
+        if strict:
+            raise _StateError("Download state exceeds its size limit: " + str(path))
         return None
     try:
-        result = json.loads(raw)
-    except (ValueError, UnicodeError, RecursionError):
+        result = json.loads(raw, object_pairs_hook=_unique_object)
+        if not isinstance(result, dict):
+            raise ValueError("Expected a JSON object")
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        if strict:
+            raise _StateError("Malformed download state; preserve or move it aside before retrying: " + str(path)) from exc
         return None
-    return result if isinstance(result, dict) else None
+    return result
 
 
-def _write_json(path, value):
+def _write_json(path, value, limit=_METADATA_LIMIT):
     _regular_stat(path)
     raw = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
-    if len(raw) > _METADATA_LIMIT:
+    if len(raw) > limit:
         raise DownloadError("Download metadata exceeds its size limit")
     fd, temporary = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(path.parent))
     try:
@@ -120,11 +143,20 @@ def _write_json(path, value):
             os.fsync(stream.fileno())
         _regular_stat(path)
         os.replace(temporary, path)
+        _sync_directory(path.parent)
     finally:
         try:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def _sync_directory(path):
+    fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def _unlink_regular(path):
@@ -137,6 +169,111 @@ def _identity(result):
         "device": result.st_dev, "inode": result.st_ino,
         "size": result.st_size, "mtime_ns": result.st_mtime_ns,
     }
+
+
+def _state_snapshot(filename):
+    if not isinstance(filename, str) or "/" in filename or "\\" in filename:
+        raise ValueError("Invalid archive filename")
+    snapshot = snapshot_from_url("http://state.invalid/" + filename)
+    if snapshot.filename != filename:
+        raise ValueError("Invalid archive filename")
+    return snapshot
+
+
+def _validate_state(value, path):
+    try:
+        if (set(value) != {"version", "files"} or type(value["version"]) is not int
+                or value["version"] != 1 or not isinstance(value["files"], dict)
+                or len(value["files"]) > 2):
+            raise ValueError("Invalid state schema")
+        full = incremental = None
+        for filename, entry in value["files"].items():
+            snapshot = _state_snapshot(filename)
+            if snapshot.incremental:
+                if incremental is not None:
+                    raise ValueError("Multiple incremental archives")
+                incremental = snapshot
+            else:
+                if full is not None:
+                    raise ValueError("Multiple full archives")
+                full = snapshot
+            if (not isinstance(entry, dict) or not entry
+                    or not set(entry).issubset({"partial", "complete"})):
+                raise ValueError("Invalid archive state entry")
+            for record in entry.values():
+                if (not isinstance(record, dict) or type(record.get("version")) is not int
+                        or record.get("version") != 1
+                        or record.get("filename") != filename
+                        or not isinstance(record.get("source"), str)
+                        or not isinstance(record.get("resolved_url"), str)):
+                    raise ValueError("Invalid archive state record")
+            if "partial" in entry:
+                record = entry["partial"]
+                if (not _positive_integer(record.get("total_size"))
+                        or type(record.get("partial_device")) is not int
+                        or type(record.get("partial_inode")) is not int):
+                    raise ValueError("Invalid partial archive state")
+            if "complete" in entry:
+                identity = entry["complete"].get("stat")
+                if (not isinstance(identity, dict)
+                        or set(identity) != {"device", "inode", "size", "mtime_ns"}
+                        or any(type(number) is not int for number in identity.values())
+                        or identity["size"] <= 0):
+                    raise ValueError("Invalid complete archive state")
+        if full and incremental and incremental.base_slot != full.slot:
+            raise ValueError("Full and incremental archive slots do not match")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise _StateError("Invalid download state structure; preserve or move it aside before retrying: " + str(path)) from exc
+    return value
+
+
+def _read_state(path):
+    value = _load_json(path, _STATE_LIMIT, strict=True)
+    if value is None:
+        return {"version": 1, "files": {}}
+    return _validate_state(value, path)
+
+
+def _write_state(path, value):
+    _validate_state(value, path)
+    _write_json(path, value, _STATE_LIMIT)
+
+
+def _select_current_pair(state, filename):
+    """Retain only this full snapshot and its one matching incremental."""
+    current = _state_snapshot(filename)
+    files = state["files"]
+    for other_name in list(files):
+        if other_name == filename:
+            continue
+        other = _state_snapshot(other_name)
+        if current.incremental:
+            keep = not other.incremental and other.slot == current.base_slot
+        else:
+            # Repeated writes of the same full preserve its current incremental.
+            keep = filename in files and other.incremental and other.base_slot == current.slot
+        if not keep:
+            del files[other_name]
+
+
+def _record(paths, kind):
+    return _read_state(paths.state)["files"].get(paths.final.name, {}).get(kind)
+
+
+def _update_record(paths, kind, value):
+    state = _read_state(paths.state)
+    filename = paths.final.name
+    if value is None:
+        entry = state["files"].get(filename)
+        if not entry or kind not in entry:
+            return
+        del entry[kind]
+        if not entry:
+            del state["files"][filename]
+    else:
+        _select_current_pair(state, filename)
+        state["files"].setdefault(filename, {})[kind] = value
+    _write_state(paths.state, state)
 
 
 def _positive_integer(value):
@@ -211,11 +348,16 @@ class Downloader:
         paths = _Paths(
             output_dir / snapshot.filename,
             output_dir / (snapshot.filename + ".part"),
+            output_dir / ".download-state.json",
             output_dir / (snapshot.filename + ".part.json"),
             output_dir / (snapshot.filename + ".complete.json"),
         )
-        for path in (paths.final, paths.part, paths.metadata, paths.receipt):
+        for path in (paths.final, paths.part, paths.state, paths.legacy_metadata, paths.legacy_receipt):
             _regular_stat(path)
+        try:
+            self._migrate(snapshot, paths)
+        except OSError as exc:
+            raise DownloadError("Could not migrate legacy download state: " + str(exc)) from exc
         if _regular_stat(paths.final) is not None:
             self._verify_existing(snapshot, paths)
             return paths.final
@@ -223,7 +365,7 @@ class Downloader:
         for attempt in range(self.options.retries + 1):
             try:
                 return self._attempt(snapshot, paths)
-            except _UnsafePath:
+            except (_UnsafePath, _StateError):
                 raise
             except (DownloadError, OSError, URLError, http.client.HTTPException) as exc:
                 last_error = exc
@@ -235,29 +377,83 @@ class Downloader:
             "Download failed after {} attempt(s): {}".format(self.options.retries + 1, last_error)
         ) from last_error
 
-    def _verify_existing(self, snapshot, paths):
-        receipt = _load_json(paths.receipt)
-        current = _regular_stat(paths.final)
-        if (not receipt or receipt.get("version") != 1
+    def _receipt_valid(self, snapshot, receipt, current):
+        if (not receipt or type(receipt.get("version")) is not int or receipt.get("version") != 1
                 or receipt.get("source") != snapshot.url
                 or receipt.get("filename") != snapshot.filename
                 or not current or current.st_size <= 0
                 or receipt.get("stat") != _identity(current)):
+            return False
+        try:
+            self._resolved(snapshot, receipt["resolved_url"])
+        except (KeyError, ValueError, TypeError, DownloadError):
+            return False
+        return True
+
+    def _verify_existing(self, snapshot, paths):
+        receipt = _record(paths, "complete")
+        current = _regular_stat(paths.final)
+        if not self._receipt_valid(snapshot, receipt, current):
             raise DownloadError(
                 "Existing archive has no matching download receipt; move it aside "
                 "or choose another output directory: " + str(paths.final)
             )
-        try:
-            self._resolved(snapshot, receipt["resolved_url"])
-        except (KeyError, ValueError, TypeError, DownloadError) as exc:
-            raise DownloadError("Existing archive has an invalid download receipt: " + str(paths.final)) from exc
+        _sync_directory(paths.final.parent)
+        # Recover the harmless state left by a crash immediately after rename.
+        _update_record(paths, "partial", None)
         if self.progress:
             self.progress(snapshot, current.st_size, current.st_size, 0.0)
 
     def _reset(self, paths):
         # Removing the identity record first makes a crash during cleanup safe.
-        _unlink_regular(paths.metadata)
+        _update_record(paths, "partial", None)
         _unlink_regular(paths.part)
+
+    def _migrate(self, snapshot, paths):
+        state = _read_state(paths.state)
+        has_metadata = _regular_stat(paths.legacy_metadata) is not None
+        has_receipt = _regular_stat(paths.legacy_receipt) is not None
+        if not has_metadata and not has_receipt:
+            return
+        if snapshot.filename in state["files"]:
+            # A current central entry is authoritative, including absent fields.
+            # Never resurrect its older partial/complete fields from legacy JSON.
+            _sync_directory(paths.state.parent)
+            _unlink_regular(paths.legacy_metadata)
+            _unlink_regular(paths.legacy_receipt)
+            return
+        metadata = _load_json(paths.legacy_metadata) if has_metadata else None
+        receipt = _load_json(paths.legacy_receipt) if has_receipt else None
+        partial = _regular_stat(paths.part)
+        final = _regular_stat(paths.final)
+        # Migrate a record using its own source. A request to another node must
+        # still reject reuse, while preserving the original source's receipt.
+        def recorded_snapshot(record):
+            try:
+                original = snapshot_from_url(record["source"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            return original if original.filename == paths.final.name else None
+
+        partial_source = recorded_snapshot(metadata)
+        complete_source = recorded_snapshot(receipt)
+        valid_partial = partial_source is not None and self._partial_valid(partial_source, metadata, partial)
+        valid_receipt = complete_source is not None and self._receipt_valid(complete_source, receipt, final or partial)
+        entry = {}
+        if valid_partial:
+            entry["partial"] = metadata
+        if valid_receipt:
+            entry["complete"] = receipt
+        if entry:
+            _select_current_pair(state, snapshot.filename)
+            state["files"][snapshot.filename] = entry
+        # Even an invalid old sidecar is removed only after a successful central
+        # state write. A failed migration retains every legacy recovery artifact.
+        _write_state(paths.state, state)
+        _unlink_regular(paths.legacy_metadata)
+        _unlink_regular(paths.legacy_receipt)
+        if has_metadata and not valid_partial and final is None:
+            _unlink_regular(paths.part)
 
     def _resolved(self, snapshot, url):
         try:
@@ -269,13 +465,11 @@ class Downloader:
             raise _Restart("Redirect changed the requested snapshot archive identity")
         return resolved.url
 
-    def _resume(self, snapshot, paths):
-        partial = _regular_stat(paths.part)
-        metadata = _load_json(paths.metadata)
+    def _partial_valid(self, snapshot, metadata, partial):
         if partial is None or partial.st_size == 0:
-            return 0, None
+            return False
         valid = (
-            metadata and metadata.get("version") == 1
+            metadata and type(metadata.get("version")) is int and metadata.get("version") == 1
             and metadata.get("source") == snapshot.url
             and metadata.get("filename") == snapshot.filename
             and _positive_integer(metadata.get("total_size"))
@@ -307,12 +501,22 @@ class Downloader:
                     valid = False
             else:
                 valid = False
-        if not valid:
+        return bool(valid)
+
+    def _resume(self, snapshot, paths):
+        partial = _regular_stat(paths.part)
+        metadata = _record(paths, "partial")
+        if partial is None or partial.st_size == 0:
+            return 0, None
+        if not self._partial_valid(snapshot, metadata, partial):
             self._reset(paths)
             return 0, None
         return partial.st_size, metadata
 
     def _attempt(self, snapshot, paths):
+        if _regular_stat(paths.final) is not None:
+            self._verify_existing(snapshot, paths)
+            return paths.final
         offset, metadata = self._resume(snapshot, paths)
         headers = {}
         if offset:
@@ -377,7 +581,7 @@ class Downloader:
                     os.fsync(fd)
                     metadata["partial_device"] = current.st_dev
                     metadata["partial_inode"] = current.st_ino
-                    _write_json(paths.metadata, metadata)
+                    _update_record(paths, "partial", metadata)
                 os.lseek(fd, offset, os.SEEK_SET)
                 self._stream(snapshot, response, fd, offset, length, total)
                 os.fsync(fd)
@@ -467,8 +671,7 @@ class Downloader:
             self.progress(snapshot, offset, offset, 0.0)
 
     def _finalize(self, snapshot, paths, metadata, result):
-        _regular_stat(paths.metadata)
-        _regular_stat(paths.receipt)
+        _regular_stat(paths.state)
         current = _regular_stat(paths.part)
         if current is None or _identity(current) != _identity(result):
             raise _Restart("Partial archive changed before publication")
@@ -478,13 +681,14 @@ class Downloader:
             "version": 1, "source": snapshot.url, "resolved_url": metadata["resolved_url"],
             "filename": snapshot.filename, "stat": _identity(result),
         }
-        _write_json(paths.receipt, receipt)
+        _update_record(paths, "complete", receipt)
         if _regular_stat(paths.final) is not None:
             raise _UnsafePath("Archive appeared during download; refusing to overwrite: " + str(paths.final))
         os.replace(paths.part, paths.final)
-        # The complete archive and receipt are already published; stale partial
-        # metadata is harmless if cleanup fails (for example, a read-only mount).
+        _sync_directory(paths.final.parent)
+        # The complete archive and receipt are already published; a stale partial
+        # field is harmless if cleanup fails (for example, a read-only mount).
         try:
-            _unlink_regular(paths.metadata)
+            _update_record(paths, "partial", None)
         except OSError:
             pass
