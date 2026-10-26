@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.1
+
+Release packaging revision. The downloader behavior is unchanged from 0.1.0.
+
 ## 0.1.0
 
 Initial independent implementation for Linux servers using Python 3.9+ and only the standard library.

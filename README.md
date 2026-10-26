@@ -152,11 +152,11 @@ python3 snapshot_downloader.py \
 
 [Releases](https://github.com/MevYu/solana-snapshot-downloader/releases) 页面列出实际已发布的版本。源码可按上面的方式直接运行；发布的 `.pyz`（如有）是 Python zipapp，仍需要 Python 3.9 或更新版本，不是独立可执行二进制文件。
 
-版本发布后，可在浏览器中从 Releases 下载同一版本的 `.pyz`、源码 `.tar.gz` 和 `SHA256SUMS`，将三者放在同一目录，再校验并运行。以下以 `0.1.0` 文件名为例，可用版本以页面为准：
+版本发布后，可在浏览器中从 Releases 下载同一版本的 `.pyz`、源码 `.tar.gz` 和 `SHA256SUMS`，将三者放在同一目录，再校验并运行。以下以 `0.1.1` 文件名为例，可用版本以页面为准：
 
 ```bash
 sha256sum -c SHA256SUMS
-python3 solana-snapshot-downloader-0.1.0.pyz --output /mnt/ledger/snapshots
+python3 solana-snapshot-downloader-0.1.1.pyz --output /mnt/ledger/snapshots
 ```
 
 在源码目录运行测试和构建发布文件：
@@ -166,12 +166,12 @@ python3 -m unittest discover -s tests -v
 python3 tools/build_release.py
 ```
 
-版本 `0.1.0` 的构建产物为 `dist/solana-snapshot-downloader-0.1.0.pyz`、`dist/solana-snapshot-downloader-0.1.0-source.tar.gz` 和 `dist/SHA256SUMS`。zipapp 通用于 amd64、arm64，无需分别构建。`SHA256SUMS` 用于检查发布包的文件一致性，不是 Solana 快照状态证明。构建后可运行：
+版本 `0.1.1` 的构建产物为 `dist/solana-snapshot-downloader-0.1.1.pyz`、`dist/solana-snapshot-downloader-0.1.1-source.tar.gz` 和 `dist/SHA256SUMS`。zipapp 通用于 amd64、arm64，无需分别构建。`SHA256SUMS` 用于检查发布包的文件一致性，不是 Solana 快照状态证明。构建后可运行：
 
 ```bash
 cd dist
 sha256sum -c SHA256SUMS
-python3 solana-snapshot-downloader-0.1.0.pyz --output /mnt/ledger/snapshots
+python3 solana-snapshot-downloader-0.1.1.pyz --output /mnt/ledger/snapshots
 ```
 
 ## 许可证与致谢
