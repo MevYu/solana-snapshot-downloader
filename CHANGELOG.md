@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2
+
+Rename the Python package to `downloader`. Run from source with `python3 snapshot_downloader.py` or `python3 -m downloader`.
+
 ## 0.1.1
 
 Release packaging revision. The downloader behavior is unchanged from 0.1.0.

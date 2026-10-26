@@ -11,10 +11,10 @@ import threading
 import unittest
 from unittest.mock import patch
 
-from solana_snapshot_downloader.cli import download_candidate, output_lock, parser
-from solana_snapshot_downloader.discovery import DiscoveryError
-from solana_snapshot_downloader.download import DownloadError
-from solana_snapshot_downloader.models import Candidate, snapshot_from_url
+from downloader.cli import download_candidate, output_lock, parser
+from downloader.discovery import DiscoveryError
+from downloader.download import DownloadError
+from downloader.models import Candidate, snapshot_from_url
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -171,8 +171,8 @@ class CLITests(unittest.TestCase):
         from unittest.mock import Mock
         downloader = Mock()
         downloader.download.side_effect = [Path(FULL), Path(INC)]
-        with patch("solana_snapshot_downloader.cli.probe_incremental", return_value=candidate.incremental), \
-                patch("solana_snapshot_downloader.cli.get_current_slot", side_effect=[1105, 9000]):
+        with patch("downloader.cli.probe_incremental", return_value=candidate.incremental), \
+                patch("downloader.cli.get_current_slot", side_effect=[1105, 9000]):
             with self.assertRaises(DiscoveryError):
                 download_candidate(candidate, downloader, args, ["http://rpc/"])
 

@@ -1,6 +1,6 @@
 import unittest
 
-from solana_snapshot_downloader.models import Candidate, http_url, snapshot_from_url
+from downloader.models import Candidate, http_url, snapshot_from_url
 
 
 class ModelTests(unittest.TestCase):

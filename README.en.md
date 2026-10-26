@@ -24,7 +24,7 @@ cd solana-snapshot-downloader
 python3 snapshot_downloader.py --output /mnt/ledger/snapshots
 ```
 
-Without Git, open the [repository](https://github.com/MevYu/solana-snapshot-downloader), choose **Code → Download ZIP**, extract the entire archive and open a terminal in the extracted project directory. Then run the same `python3 snapshot_downloader.py` command. Keep the `solana_snapshot_downloader/` package alongside the script; downloading only the entry script is insufficient.
+Without Git, open the [repository](https://github.com/MevYu/solana-snapshot-downloader), choose **Code → Download ZIP**, extract the entire archive and open a terminal in the extracted project directory. Then run the same `python3 snapshot_downloader.py` command. Keep the `downloader/` package alongside the script; downloading only the entry script is insufficient.
 
 Choose an output directory with enough free space that your user can write to. For example:
 
@@ -35,7 +35,7 @@ python3 snapshot_downloader.py --output "$HOME/solana-snapshots"
 The module entry point also works from the project directory:
 
 ```bash
-python3 -m solana_snapshot_downloader --output /mnt/ledger/snapshots
+python3 -m downloader --output /mnt/ledger/snapshots
 python3 snapshot_downloader.py --help
 ```
 
@@ -142,11 +142,11 @@ Completion checks cover HTTP transfer length and resource identity; they **do no
 
 Check [Releases](https://github.com/MevYu/solana-snapshot-downloader/releases) for versions that have actually been published. You can run the source directly as described above. A release `.pyz`, when available, is a Python zipapp and still requires Python 3.9 or newer; it is not a standalone binary.
 
-Once a version is published, use your browser to download its `.pyz`, source `.tar.gz` and `SHA256SUMS` from Releases into the same directory. Verify the files before running. This example uses `0.1.1` filenames; availability depends on the Releases page:
+Once a version is published, use your browser to download its `.pyz`, source `.tar.gz` and `SHA256SUMS` from Releases into the same directory. Verify the files before running. This example uses `0.1.2` filenames; availability depends on the Releases page:
 
 ```bash
 sha256sum -c SHA256SUMS
-python3 solana-snapshot-downloader-0.1.1.pyz --output /mnt/ledger/snapshots
+python3 solana-snapshot-downloader-0.1.2.pyz --output /mnt/ledger/snapshots
 ```
 
 From the source directory:
@@ -156,12 +156,12 @@ python3 -m unittest discover -s tests -v
 python3 tools/build_release.py
 ```
 
-For version `0.1.1`, the build generates `dist/solana-snapshot-downloader-0.1.1.pyz`, `dist/solana-snapshot-downloader-0.1.1-source.tar.gz` and `dist/SHA256SUMS`. The zipapp works across amd64 and arm64 without separate builds. `SHA256SUMS` checks release-file consistency, not Solana snapshot state. After building:
+For version `0.1.2`, the build generates `dist/solana-snapshot-downloader-0.1.2.pyz`, `dist/solana-snapshot-downloader-0.1.2-source.tar.gz` and `dist/SHA256SUMS`. The zipapp works across amd64 and arm64 without separate builds. `SHA256SUMS` checks release-file consistency, not Solana snapshot state. After building:
 
 ```bash
 cd dist
 sha256sum -c SHA256SUMS
-python3 solana-snapshot-downloader-0.1.1.pyz --output /mnt/ledger/snapshots
+python3 solana-snapshot-downloader-0.1.2.pyz --output /mnt/ledger/snapshots
 ```
 
 ## License and acknowledgments

@@ -8,11 +8,11 @@ import time
 import unittest
 from unittest.mock import patch
 
-from solana_snapshot_downloader.discovery import (
+from downloader.discovery import (
     DiscoveryError, discover_nodes, get_current_slot, measure_speed,
     probe_incremental, probe_node, probe_nodes,
 )
-from solana_snapshot_downloader.models import Candidate, snapshot_from_url
+from downloader.models import Candidate, snapshot_from_url
 
 
 HASH = "1" * 32
@@ -133,7 +133,7 @@ class DiscoveryRPCTests(unittest.TestCase):
     def test_invalid_current_slots_raise_instead_of_fabricating_a_slot(self):
         for value in (None, True, -1, "1200", {}, []):
             with self.subTest(value=value):
-                with patch("solana_snapshot_downloader.discovery.rpc_call", return_value=value):
+                with patch("downloader.discovery.rpc_call", return_value=value):
                     with self.assertRaises(DiscoveryError):
                         get_current_slot(["http://example.test"])
         with self.assertRaises(DiscoveryError):
@@ -149,7 +149,7 @@ class DiscoveryRPCTests(unittest.TestCase):
     def test_empty_private_or_malformed_cluster_is_an_error(self):
         for result in ({}, None, [], [{"rpc": None}], [{"rpc": "127.0.0.1:8899"}]):
             with self.subTest(result=result):
-                with patch("solana_snapshot_downloader.discovery.rpc_call", return_value=result):
+                with patch("downloader.discovery.rpc_call", return_value=result):
                     with self.assertRaises(DiscoveryError):
                         discover_nodes(["http://example.test"])
 
@@ -281,7 +281,7 @@ class SnapshotProbeTests(unittest.TestCase):
                 raise AssertionError("archive body read during probe")
 
         response = FakeResponse()
-        with patch("solana_snapshot_downloader.discovery.open_url", return_value=response):
+        with patch("downloader.discovery.open_url", return_value=response):
             candidates = probe_nodes(["http://example.test"], full_only=True)
         self.assertEqual(len(candidates), 1)
         self.assertTrue(response.closed)
@@ -302,7 +302,7 @@ class ProbeRankingTests(unittest.TestCase):
             "future": self.candidate("future", 1101),
         }
         callbacks = []
-        with patch("solana_snapshot_downloader.discovery.probe_node", side_effect=lambda node, timeout: candidates[node]) as probe:
+        with patch("downloader.discovery.probe_node", side_effect=lambda node, timeout: candidates[node]) as probe:
             result = probe_nodes(list(candidates) + ["fresh"], workers=2,
                                  current_slot=1000, max_slot_age=100,
                                  on_result=lambda *args: callbacks.append(args))
@@ -314,7 +314,7 @@ class ProbeRankingTests(unittest.TestCase):
     def test_age_zero_disables_age_limit_but_not_future_limit(self):
         candidates = {node: self.candidate(node, slot)
                       for node, slot in (("old", 1), ("edge", 1100), ("future", 1101))}
-        with patch("solana_snapshot_downloader.discovery.probe_node", side_effect=lambda node, timeout: candidates[node]):
+        with patch("downloader.discovery.probe_node", side_effect=lambda node, timeout: candidates[node]):
             result = probe_nodes(candidates, current_slot=1000, max_slot_age=0)
         self.assertEqual([candidate.node for candidate in result], ["edge", "old"])
 
@@ -326,7 +326,7 @@ class ProbeRankingTests(unittest.TestCase):
                 raise DiscoveryError("probe failed")
             return self.candidate(node, 1000)
 
-        with patch("solana_snapshot_downloader.discovery.probe_node", side_effect=probe):
+        with patch("downloader.discovery.probe_node", side_effect=probe):
             result = probe_nodes(["bad", "good"], on_result=lambda *args: callbacks.append(args))
         self.assertEqual([candidate.node for candidate in result], ["good"])
         bad = next(entry for entry in callbacks if entry[0] == "bad")

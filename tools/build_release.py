@@ -11,13 +11,13 @@ import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION_TEXT = (ROOT / "solana_snapshot_downloader" / "__init__.py").read_text(encoding="utf-8")
+VERSION_TEXT = (ROOT / "downloader" / "__init__.py").read_text(encoding="utf-8")
 VERSION = re.search(r'^__version__ = "([0-9]+\.[0-9]+\.[0-9]+)"$', VERSION_TEXT, re.M).group(1)
 NAME = "solana-snapshot-downloader-" + VERSION
 ENTRY = b'''import sys
 if sys.version_info < (3, 9):
     sys.exit("Python 3.9 or newer is required")
-from solana_snapshot_downloader.cli import main
+from downloader.cli import main
 sys.exit(main())
 '''
 
@@ -26,7 +26,7 @@ def source_files():
     files = [ROOT / name for name in (
         "snapshot_downloader.py", "README.md", "README.en.md", "LICENSE", ".gitignore", "CHANGELOG.md",
     )]
-    for folder in ("solana_snapshot_downloader", "tests", "tools", ".github"):
+    for folder in ("downloader", "tests", "tools", ".github"):
         files.extend(path for path in (ROOT / folder).rglob("*")
                      if path.is_file() and "__pycache__" not in path.parts
                      and path.suffix in (".py", ".yml", ".yaml"))
@@ -38,7 +38,7 @@ def build():
     output.mkdir(exist_ok=True)
     app = output / (NAME + ".pyz")
     entries = {"__main__.py": ENTRY}
-    for path in sorted((ROOT / "solana_snapshot_downloader").glob("*.py")):
+    for path in sorted((ROOT / "downloader").glob("*.py")):
         entries[path.relative_to(ROOT).as_posix()] = path.read_bytes()
     entries["LICENSE"] = (ROOT / "LICENSE").read_bytes()
     with app.open("wb") as stream:

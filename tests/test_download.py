@@ -12,8 +12,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from solana_snapshot_downloader.download import DownloadError, DownloadOptions, Downloader
-from solana_snapshot_downloader.models import snapshot_from_url
+from downloader.download import DownloadError, DownloadOptions, Downloader
+from downloader.models import snapshot_from_url
 
 
 NAME = "snapshot-123-" + "A" * 32 + ".tar.zst"
@@ -528,7 +528,7 @@ class DownloadTests(unittest.TestCase):
 
     def test_disk_preflight_does_not_create_partial(self):
         with server(lambda request: reply(request)) as base:
-            with patch("solana_snapshot_downloader.download.shutil.disk_usage") as usage:
+            with patch("downloader.download.shutil.disk_usage") as usage:
                 usage.return_value.free = 0
                 with self.assertRaisesRegex(DownloadError, "disk space"):
                     self.download(base + NAME)
@@ -539,7 +539,7 @@ class DownloadTests(unittest.TestCase):
         options = DownloadOptions(retries=0, retry_delay=0, chunk_size=1024,
                                   min_speed=10**9, speed_window=0.5)
         with server(lambda request: reply(request)) as base:
-            with patch("solana_snapshot_downloader.download.time.monotonic", side_effect=[0.0, 0.0, 1.0]):
+            with patch("downloader.download.time.monotonic", side_effect=[0.0, 0.0, 1.0]):
                 with self.assertRaisesRegex(DownloadError, "speed"):
                     self.download(base + NAME, options=options)
         self.assertFalse(self.final.exists())
@@ -608,7 +608,7 @@ class DownloadTests(unittest.TestCase):
 
         options = DownloadOptions(retries=2, retry_delay=0.1)
         with server(handler) as base:
-            with patch("solana_snapshot_downloader.download.time.sleep") as sleep:
+            with patch("downloader.download.time.sleep") as sleep:
                 with self.assertRaisesRegex(DownloadError, "3 attempt"):
                     self.download(base + NAME, options=options)
                 self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.1, 0.2])

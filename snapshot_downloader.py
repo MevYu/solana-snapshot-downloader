@@ -6,7 +6,7 @@ import sys
 if sys.version_info < (3, 9):
     sys.exit("Python 3.9 or newer is required. Check: python3 --version")
 
-from solana_snapshot_downloader.cli import main
+from downloader.cli import main
 
 if __name__ == "__main__":
     sys.exit(main())

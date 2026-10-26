@@ -27,7 +27,7 @@ jobs:
       - name: Check source entry points
         run: |
           python3 snapshot_downloader.py --help
-          python3 -m solana_snapshot_downloader --version
+          python3 -m downloader --version
       - name: Build and check archives
         run: |
           python3 tools/build_release.py
@@ -50,7 +50,7 @@ jobs:
         run: |
           python3 - <<'PY'
           import os
-          from solana_snapshot_downloader import __version__
+          from downloader import __version__
           assert os.environ['GITHUB_REF_NAME'] == 'v' + __version__, 'Tag must match package version'
           PY
       - name: Build
