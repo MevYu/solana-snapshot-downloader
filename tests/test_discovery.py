@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from downloader.discovery import (
     DiscoveryError, discover_nodes, get_current_slot, measure_speed,
@@ -196,6 +197,70 @@ class SnapshotProbeTests(unittest.TestCase):
         with serve(routes) as (url, requests):
             self.assertEqual(probe_node(url).full.slot, 1000)
         self.assertIn(("GET", full_path(), "bytes=0-0"), requests)
+
+    def test_unsupported_zst_methods_fall_back_to_bz2(self):
+        for status in (405, 501):
+            for redirected in (False, True):
+                with self.subTest(status=status, redirected=redirected):
+                    routes = archive_routes(extension="bz2")
+                    aliases = ("/snapshot.tar.zst", "/incremental-snapshot.tar.zst")
+                    paths = (full_path(), incremental_path()) if redirected else aliases
+                    for alias, path in zip(aliases, paths):
+                        routes[alias] = redirect(path) if redirected else (status, {}, b"")
+                        routes[path] = (status, {}, b"")
+                    with serve(routes) as (url, requests):
+                        candidate = probe_node(url)
+                        incremental = probe_incremental(url)
+                    self.assertEqual(candidate.full.url, url + full_path(extension="bz2"))
+                    self.assertEqual(candidate.incremental.url,
+                                     url + incremental_path(extension="bz2"))
+                    self.assertEqual(incremental, candidate.incremental)
+                    for alias, path in zip(aliases, paths):
+                        self.assertLess(requests.index(("HEAD", path, None)),
+                                        requests.index(("GET", path, "bytes=0-0")))
+                        self.assertLess(requests.index(("GET", path, "bytes=0-0")),
+                                        requests.index(("HEAD", alias[:-3] + "bz2", None)))
+
+    def test_successful_zst_get_is_preferred_to_bz2(self):
+        routes = archive_routes()
+        routes.update(archive_routes(extension="bz2"))
+        routes[("HEAD", "/snapshot.tar.zst")] = (405, {}, b"")
+        routes[("HEAD", "/incremental-snapshot.tar.zst")] = (501, {}, b"")
+        with serve(routes) as (url, requests):
+            candidate = probe_node(url)
+            incremental = probe_incremental(url)
+        self.assertEqual(candidate.full.url, url + full_path())
+        self.assertEqual(candidate.incremental.url, url + incremental_path())
+        self.assertEqual(incremental, candidate.incremental)
+        self.assertIn(("GET", "/snapshot.tar.zst", "bytes=0-0"), requests)
+        self.assertIn(("GET", "/incremental-snapshot.tar.zst", "bytes=0-0"), requests)
+        self.assertFalse(any(path.endswith(".bz2") for _, path, _ in requests))
+
+    def test_failed_formats_preserve_non_missing_http_errors(self):
+        failures = ((405, 404, 405), (501, 404, 501),
+                    (404, 405, 405), (404, 501, 501),
+                    (405, 501, 405), (501, 405, 501),
+                    (500, 404, 500), (503, 404, 503),
+                    (405, 500, 500), (501, 503, 503))
+        for probe, incremental in ((probe_node, False), (probe_node, True),
+                                   (probe_incremental, True)):
+            for zst_status, bz2_status, error_status in failures:
+                with self.subTest(probe=probe.__name__, incremental=incremental,
+                                  zst=zst_status, bz2=bz2_status):
+                    prefix = "/incremental-snapshot" if incremental else "/snapshot"
+                    routes = archive_routes(incremental=None)
+                    routes[prefix + ".tar.zst"] = (zst_status, {}, b"")
+                    routes[prefix + ".tar.bz2"] = (bz2_status, {}, b"")
+                    with serve(routes) as (url, requests):
+                        with self.assertRaises(DiscoveryError) as caught:
+                            probe(url)
+                    self.assertIsInstance(caught.exception.__cause__, HTTPError)
+                    self.assertEqual(caught.exception.__cause__.code, error_status)
+                    bz2_request = ("HEAD", prefix + ".tar.bz2", None)
+                    if zst_status in (404, 405, 501):
+                        self.assertIn(bz2_request, requests)
+                    else:
+                        self.assertNotIn(bz2_request, requests)
 
     def test_absent_incremental_is_safe_full_only_candidate(self):
         with serve(archive_routes(incremental=None)) as (url, _):

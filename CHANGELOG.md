@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.4
+
+- Try the legacy `.bz2` snapshot alias when the `.zst` alias still returns HTTP 405 or 501 after the single-byte GET fallback, including incremental snapshot refreshes.
+- Preserve probe failures when no alias succeeds; only HTTP 404 for both aliases means an incremental snapshot is absent.
+- Add regression coverage for alias fallback, successful `.zst` GET probes, and HTTP error handling.
+
 ## 0.1.3
 
 - Show live search, speed-test and download progress, with byte totals, speed and ETA.

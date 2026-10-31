@@ -124,13 +124,21 @@ def _probe_alias(url: str, timeout: float, incremental: bool) -> Snapshot:
 
 def _probe_archive(node: str, timeout: float, incremental: bool) -> Optional[Snapshot]:
     prefix = "incremental-snapshot" if incremental else "snapshot"
+    method_error = None
     for extension in ("zst", "bz2"):
         alias = urljoin(node, "/" + prefix + ".tar." + extension)
         try:
             return _probe_alias(alias, timeout, incremental)
         except HTTPError as exc:
-            if exc.code != 404:
+            if exc.code in (405, 501):
+                if method_error is None:
+                    method_error = exc
+            elif exc.code != 404:
                 raise
+    # Unsupported methods can be specific to an archive format. Only treat
+    # the incremental as absent when every supported format returned 404.
+    if method_error is not None:
+        raise method_error
     if incremental:
         return None
     raise DiscoveryError("Node has no full snapshot archive")
